@@ -3,10 +3,9 @@ package plantae.citrus.mqtt.actors.session
 import java.util.concurrent.TimeUnit
 
 import akka.actor._
-import plantae.citrus.mqtt.actors.ActorContainer
-import plantae.citrus.mqtt.actors.directory.{DirectoryReq, DirectoryResp, TypeTopic}
+import plantae.citrus.mqtt.actors.SystemRoot
+import plantae.citrus.mqtt.actors.directory._
 import plantae.citrus.mqtt.actors.topic.TopicInMessage
-import plantae.citrus.mqtt.dto.BYTE
 import plantae.citrus.mqtt.dto.connect.Will
 
 import scala.concurrent.ExecutionContext
@@ -18,40 +17,59 @@ import scala.concurrent.duration.FiniteDuration
 case class ConnectionStatus(will: Option[Will], keepAliveTime: Int, session: ActorRef, sessionContext: ActorContext, socket: ActorRef) {
   implicit val ec: ExecutionContext = ExecutionContext.Implicits.global
 
-  private var keepAliveTimer: Cancellable = ActorContainer.system.scheduler.scheduleOnce(
-    FiniteDuration(keepAliveTime, TimeUnit.SECONDS), session, SessionKeepAliveTimeOut)
-
-  private var publishActor: Option[ActorRef] = None
+  private var keepAliveTimer: Option[Cancellable] = if (keepAliveTime > 0)
+    Some(SystemRoot.system.scheduler.scheduleOnce(FiniteDuration(keepAliveTime, TimeUnit.SECONDS), session, SessionKeepAliveTimeOut))
+  else None
 
   def cancelTimer = {
-    keepAliveTimer.cancel()
+    keepAliveTimer match {
+      case Some(x) => x.cancel()
+      case None =>
+    }
+
   }
 
   def resetTimer = {
     cancelTimer
-    keepAliveTimer = ActorContainer.system.scheduler.scheduleOnce(
-      FiniteDuration(keepAliveTime, TimeUnit.SECONDS), session, SessionKeepAliveTimeOut)
+    keepAliveTimer = if (keepAliveTime > 0)
+      Some(SystemRoot.system.scheduler.scheduleOnce(FiniteDuration(keepAliveTime, TimeUnit.SECONDS), session, SessionKeepAliveTimeOut))
+    else None
   }
 
-  def handleWill = {
+  private def publishWill = {
     will match {
       case Some(x) =>
-        ActorContainer.invokeCallback(DirectoryReq(x.topic.value, TypeTopic), sessionContext, Props(new Actor {
+        SystemRoot.directoryProxy.tell(DirectoryTopicRequest(x.topic), sessionContext.actorOf(Props(new Actor {
           def receive = {
-            case DirectoryResp(name, actor) =>
-              val topicInMessage = TopicInMessage(x.message.value.getBytes, (x.qos >> 3 & BYTE(0x03.toByte)).value.toShort, x.retain, x.qos.value.toShort match {
+            case DirectoryTopicResult(name, actors) =>
+              val topicInMessage = TopicInMessage(x.message.toArray, x.qos, x.retain, x.qos match {
                 case 0 => None
-                case qos if (qos > 0) => Some(1)
+                case qos if (qos > 0) => Some(0)
               })
-              actor.tell(topicInMessage, ActorRef.noSender)
+
+              actors.foreach {
+                _.tell(topicInMessage, ActorRef.noSender)
+              }
+
+              context.stop(self)
           }
         }
-        ))
+        )))
+
       case None =>
     }
   }
 
-  def destory = {
+  def destroyProperly = {
+    sessionContext.stop(socket)
     cancelTimer
   }
+
+  def destroyAbnormally = {
+    sessionContext.stop(socket)
+    publishWill
+    cancelTimer
+  }
+
+
 }

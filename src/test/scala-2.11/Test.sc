@@ -1,8 +1,26 @@
+import java.net.{InetAddress, NetworkInterface}
 
-val a = List(List(1,2,3), List(2), List(3))
+InetAddress.getLocalHost.getHostAddress
 
-a.flatten
+val en = NetworkInterface.getNetworkInterfaces();
+while (en.hasMoreElements()) {
+  val ni = en.nextElement()
+  val ee = ni.getInetAddresses();
+  while (ee.hasMoreElements()) {
+    val ia = ee.nextElement();
+    System.out.println(ia.getHostAddress());
+  }
+}
 
-val b = List(1, null, 2, 3)
 
-b.filter(x => x != null)
+
+InetAddress.getAllByName(InetAddress.getLocalHost().getCanonicalHostName()) match {
+  case null => "127.0.0.1"
+  case Array() => "127.0.0.1"
+  case hostNames: Array[InetAddress] => hostNames.filterNot(x => x.getHostAddress.equals("127.0.0.1")) match {
+    case Array() => "127.0.0.1"
+    case other: Array[InetAddress] => other(0).getHostAddress
+  }
+}
+
+

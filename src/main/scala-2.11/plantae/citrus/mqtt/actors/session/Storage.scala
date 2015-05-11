@@ -4,14 +4,16 @@ import java.io._
 import java.text.SimpleDateFormat
 import java.util.{Date, UUID}
 
+import akka.actor.ActorRef
 import com.google.common.base.Throwables
 import org.slf4j.LoggerFactory
-import plantae.citrus.mqtt.dto.publish.PUBLISH
-import plantae.citrus.mqtt.dto.{INT, PUBLISHPAYLOAD, STRING}
+import plantae.citrus.mqtt.actors.SystemRoot
+import plantae.citrus.mqtt.packet.{FixedHeader, PublishPacket}
+import scodec.bits.ByteVector
 
 class Storage(sessionName: String) extends Serializable {
   private val log = LoggerFactory.getLogger(getClass() + sessionName)
-  val chunkSize = 10
+  private val chunkSize = 200
 
   sealed trait Location
 
@@ -24,7 +26,7 @@ class Storage(sessionName: String) extends Serializable {
   case class ChunkMessage(var location: Location, var readyMessages: List[ReadyMessage]) {
     def serialize = {
       try {
-        val directory = new File("data/" + sessionName + "/" + (new SimpleDateFormat("yyyy/MM/dd").format(new Date())))
+        val directory = new File(SystemRoot.config.getString("mqtt.broker.session.storeDir") + "/" + sessionName + "/" + (new SimpleDateFormat("yyyy/MM/dd").format(new Date())))
         directory.mkdirs()
         val path: String = directory.getAbsolutePath + "/" + UUID.randomUUID().toString
         val outputStreamer = new ObjectOutputStream(new FileOutputStream(path))
@@ -34,8 +36,7 @@ class Storage(sessionName: String) extends Serializable {
         readyMessages = List()
       } catch {
         case t: Throwable => location = OnMemory
-          log.error(" Chunck serialize error : {} ", Throwables.getStackTraceAsString(t))
-
+          log.error(" Chunk serialize error : {} ", Throwables.getStackTraceAsString(t))
       }
     }
 
@@ -43,11 +44,16 @@ class Storage(sessionName: String) extends Serializable {
       location match {
         case OnMemory =>
         case OnDisk(path) =>
-          val inputStreamer = new ObjectInputStream(new FileInputStream(path))
-          readyMessages = inputStreamer.readObject().asInstanceOf[ChunkMessage].readyMessages
-          location = OnMemory
-          new File(path).delete()
-          inputStreamer.close()
+          try {
+            val inputStreamer = new ObjectInputStream(new FileInputStream(path))
+            readyMessages = inputStreamer.readObject().asInstanceOf[ChunkMessage].readyMessages
+            location = OnMemory
+            new File(path).delete()
+            inputStreamer.close()
+          } catch {
+            case t: Throwable => location = OnMemory
+              log.error(" Chunk deserialize error : {} ", Throwables.getStackTraceAsString(t))
+          }
       }
 
     }
@@ -61,10 +67,11 @@ class Storage(sessionName: String) extends Serializable {
   }
 
 
-  private var packetIdGenerator: Short = 0
+  private var packetIdGenerator: Int = 0
   private var topics: List[String] = List()
   private var readyQueue: List[ChunkMessage] = List()
-  private var workQueue: List[PUBLISH] = List()
+  private var workQueue: List[PublishPacket] = List()
+  private var redoQueue: List[PublishPacket] = List()
 
   def persist(payload: Array[Byte], qos: Short, retain: Boolean, topic: String) = {
     readyQueue match {
@@ -82,10 +89,10 @@ class Storage(sessionName: String) extends Serializable {
   }
 
 
-  def complete(packetId: Option[Short]) =
+  def complete(packetId: Option[Int]) =
     packetId match {
       case Some(y) => workQueue = workQueue.filterNot(_.packetId match {
-        case Some(x) => x.value == y
+        case Some(x) => x == y
         case None => false
       })
       case None =>
@@ -108,28 +115,47 @@ class Storage(sessionName: String) extends Serializable {
     }
   }
 
-  def nextMessage: Option[PUBLISH] = {
-
-    if (workQueue.size > 0) {
+  def nextMessage: Option[PublishPacket] = {
+    if (workQueue.size > 10) {
       None
-    } else popFirstMessage match {
-      case Some(message) =>
-        val publish = message.qos match {
-          case x if (x > 0) =>
-            val publish = PUBLISH(false, INT(message.qos), message.retain, STRING(message.topic), Some(INT(nextPacketId)), PUBLISHPAYLOAD(message.payload))
-            workQueue = workQueue :+ publish
-            publish
+    } else {
+      redoQueue match {
+        case head :: tail =>
+          redoQueue = tail
+          workQueue = workQueue :+ head
+          Some(PublishPacket(FixedHeader(true, head.fixedHeader.qos, head.fixedHeader.retain), head.topic, head.packetId, head.payload))
+        case Nil =>
+          popFirstMessage match {
+            case Some(message) =>
+              val publish = message.qos match {
+                case x if (x > 0) =>
+                  val publishPacket = PublishPacket(FixedHeader(dup = false, qos = message.qos, retain = message.retain),
+                    topic = message.topic,
+                    packetId = Some(nextPacketId),
+                    ByteVector(message.payload)
+                  )
+                  workQueue = workQueue :+ publishPacket
+                  publishPacket
 
-          case x if (x == 0) =>
-            PUBLISH(false, INT(message.qos), message.retain, STRING(message.topic), None, PUBLISHPAYLOAD(message.payload))
-        }
-        Some(publish)
-      case None => None
+                case x if (x == 0) =>
+                  PublishPacket(FixedHeader(dup = false, qos = message.qos, retain = message.retain),
+                    topic = message.topic,
+                    packetId = Some(nextPacketId),
+                    ByteVector(message.payload)
+                  )
+              }
+
+              Some(publish)
+            case None => None
+          }
+      }
+
     }
   }
 
-
   def socketClose = {
+    redoQueue = redoQueue ++ workQueue
+    workQueue = Nil
   }
 
   def clear = {
@@ -139,11 +165,11 @@ class Storage(sessionName: String) extends Serializable {
     workQueue = List()
   }
 
-  private def nextPacketId = {
+  private def nextPacketId: Int = {
     packetIdGenerator = {
-      if (packetIdGenerator < 0)
-        0
-      else (packetIdGenerator + 1).toShort
+      if ((packetIdGenerator + 1) >= Short.MaxValue)
+        1
+      else (packetIdGenerator + 1)
     }
     packetIdGenerator
   }
@@ -158,4 +184,6 @@ class Storage(sessionName: String) extends Serializable {
 
 object Storage {
   def apply(sessionName: String) = new Storage(sessionName)
+
+  def apply(session: ActorRef) = new Storage(session.path.name)
 }

@@ -3,25 +3,40 @@ package plantae.citrus.mqtt.actors.topic
 import akka.actor._
 
 import scala.collection.mutable.Map
+import scala.collection
+import scala.collection.parallel.mutable
 import scala.util.Random
 
 sealed trait TopicRequest
 
 sealed trait TopicResponse
 
-case class Subscribe(clientId: String) extends TopicRequest
+case class Subscribe(sessionAndQos: SessionAndQos) extends TopicRequest
 
-case class Unsubscribe(clientId: String) extends TopicRequest
+case class Unsubscribe(session: ActorRef) extends TopicRequest
+
+case class Subscribed(topicName: String) extends TopicResponse
+
+case class Unsubscribed(topicName: String) extends TopicResponse
 
 case object ClearList extends TopicRequest
 
-case class TopicInMessage(payload: Array[Byte], qos: Short, retain: Boolean, packetId: Option[Short]) extends TopicRequest
+case class TopicInMessage(payload: Array[Byte], qos: Short, retain: Boolean, packetId: Option[Int]) extends TopicRequest
 
 case object TopicInMessageAck extends TopicResponse
 
 case class TopicOutMessage(payload: Array[Byte], qos: Short, retain: Boolean, topic: String) extends TopicResponse
 
 case object TopicOutMessageAck extends TopicRequest
+
+case class TopicCreateRequest(topicName: String)
+
+case class TopicCreateResponse(topicName: String, topic: List[ActorRef])
+
+case class TopicExistRequest(topicName: String)
+
+case class TopicExistResponse(topicName: String, topic: Option[List[ActorRef]])
+
 
 class TopicRoot extends Actor with ActorLogging {
 
@@ -37,64 +52,88 @@ class TopicRoot extends Actor with ActorLogging {
           sender ! List(topic)
         }
         case topics: List[ActorRef] => sender ! topics
-
       }
-      //      context.child(topicName) match {
-      //        case Some(x) => sender ! x
-      //        case None => log.debug("new topic is created [{}]", topicName)
-      //          sender ! context.actorOf(Props[Topic], topicName)
-      //      }
     }
+    case TopicCreateRequest(topicName) =>
+      root.getNodes(topicName) match {
+        case Nil =>
+          val topic = context.actorOf(Props(classOf[Topic], topicName), Random.alphanumeric.take(128).mkString)
+          root.addNode(topicName, topic)
+          sender ! TopicCreateResponse(topicName, List(topic))
+        case topics: List[ActorRef] => sender ! TopicCreateResponse(topicName, topics)
+      }
+
+
+    case TopicExistRequest(topicName) =>
+      sender ! TopicExistResponse(topicName, root.getNodes(topicName) match {
+        case Nil => None
+        case topics: List[ActorRef] => Some(topics)
+      })
   }
 }
 
+case class SessionAndQos(session: ActorRef, qos: Short)
+
 class Topic(name: String) extends Actor with ActorLogging {
-  val subscriberMap: Map[String, ActorRef] = Map()
+  private val subscriberMap2: collection.mutable.HashMap[ActorRef, Short] = collection.mutable.HashMap[ActorRef, Short]()
+//  private val subscriberMap: collection.mutable.HashSet[ActorRef] = collection.mutable.HashSet()
 
   def receive = {
-    //    case Terminated(a) => {
-    //
-    //    }
-    case Subscribe(clientId) => {
-      log.debug("Subscribe client({}) topic({})", clientId, name)
-      subscriberMap.+=((clientId, sender))
-      //      context.watch(sender())
+
+    case Subscribe(sessionAndQos) => {
+      log.debug("Subscribe client({}) qos({}) topic({})", sessionAndQos.session.path.name, sessionAndQos.qos, name)
+      if (!subscriberMap2.contains(sessionAndQos.session))
+        subscriberMap2.+= ((sessionAndQos.session, sessionAndQos.qos))
+      else {
+        if (subscriberMap2.get(sessionAndQos.session).get < sessionAndQos.qos){
+          log.debug("Subscribe qos changed  qos(from({}) to({})) topic({})", subscriberMap2.get(sessionAndQos.session).get,
+            sessionAndQos.qos, name)
+          subscriberMap2.-=(sessionAndQos.session)
+          subscriberMap2.+=((sessionAndQos.session, sessionAndQos.qos))
+        }
+      }
+
+      sender ! Subscribed(name)
       printEverySubscriber
     }
 
-    case Unsubscribe(clientId) => {
-      log.debug("Unsubscribe client({}) topic({})", clientId, name)
-      subscriberMap.-(clientId)
+    case Unsubscribe(session) => {
+      log.debug("Unsubscribe client({}) topic({})", session.path.name, name)
+
+      subscriberMap2.-=(session)
+
+      sender ! Unsubscribed(name)
       printEverySubscriber
     }
 
     case ClearList => {
       log.debug("Clear subscriber list")
-      subscriberMap.clear()
+      subscriberMap2.clear()
       printEverySubscriber
     }
 
     case TopicInMessage(payload, qos, retain, packetId) => {
-      log.debug("qos : {} , retain : {} , payload : {} , sender {}", qos, retain, new String(payload), sender)
+      log.info("[TOPIC] qos : {} , retain : {} , payload : {} , sender {} subscriberCount " + subscriberMap2.size, qos, retain, new String(payload), sender )
       sender ! TopicInMessageAck
-      subscriberMap.values.foreach(
-        (actor) => {
-          actor ! TopicOutMessage(payload, qos, retain, name)}
+
+      subscriberMap2.par.foreach(
+        (sessionAndQos) => {
+          sessionAndQos._1 ! TopicOutMessage(payload, sessionAndQos._2, retain, name)
+        }
       )
     }
-    case TopicOutMessageAck =>
   }
 
   def printEverySubscriber = {
     log.debug("{}'s subscriber ", name)
-    subscriberMap.foreach(s => log.debug("{},", s._1))
+    subscriberMap2.foreach(s => log.debug("{},", s))
   }
 }
 
-case class DiskTreeNode[A](name: String, fullPath: String, children: Map[String, DiskTreeNode[A]] = Map[String, DiskTreeNode[A]]()){
+case class DiskTreeNode[A](name: String, fullPath: String, children: Map[String, DiskTreeNode[A]] = Map[String, DiskTreeNode[A]]()) {
   var topic: Option[A] = None
 
-  def pathToList(path: String) : List[String] = {
+  def pathToList(path: String): List[String] = {
     path.split("/").toList
   }
 
@@ -111,7 +150,7 @@ case class DiskTreeNode[A](name: String, fullPath: String, children: Map[String,
             node.addNode(paths.tail, path, topic)
           }
           case None => {
-            val node = new DiskTreeNode[A](paths.head, fullPath +"/" +paths.head)
+            val node = new DiskTreeNode[A](paths.head, fullPath + "/" + paths.head)
             node.addNode(paths.tail, path, topic)
             children.+=((paths.head, node))
           }
@@ -127,9 +166,9 @@ case class DiskTreeNode[A](name: String, fullPath: String, children: Map[String,
   }
 
   def removeNode(paths: List[String]): Boolean = {
-    if(paths.size == 1){
+    if (paths.size == 1) {
       children.-(paths.head)
-    } else if(paths.size > 1) {
+    } else if (paths.size > 1) {
       children.get(paths.head) match {
         case Some(node: DiskTreeNode[A]) => {
           node.removeNode(paths.tail)
@@ -145,20 +184,18 @@ case class DiskTreeNode[A](name: String, fullPath: String, children: Map[String,
     getNodes(pathToList(path))
   }
 
-  def getNodes(paths: List[String]) : List[A] = {
+  def getNodes(paths: List[String]): List[A] = {
     paths match {
       case Nil => List()
       case x :: Nil => {
         x match {
           case "*" => getEveryNodes()
           case "+" => {
-            children.filter(x => x._2.topic.isDefined).map(y => y._2.topic match {
-              case Some(t) => t
-            }).toList
+            children.filter(x => x._2.topic.isDefined).map(y => y._2.topic.get).toList
           }
           case _ => {
             children.get(x) match {
-              case Some(node:DiskTreeNode[A]) => {
+              case Some(node: DiskTreeNode[A]) => {
                 node.topic match {
                   case Some(t) => List(t)
                   case None => List()

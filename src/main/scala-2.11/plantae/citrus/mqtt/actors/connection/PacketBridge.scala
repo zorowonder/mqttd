@@ -1,101 +1,113 @@
 package plantae.citrus.mqtt.actors.connection
 
-import java.util.concurrent.TimeUnit
-
-import akka.actor.{Actor, ActorLogging, ActorRef, Props}
-import akka.io.Tcp.{Event, PeerClosed, Received, Write}
-import akka.pattern.ask
+import akka.actor._
+import akka.io.Tcp.{PeerClosed, Received, Write}
 import akka.util.ByteString
-import plantae.citrus.mqtt.actors.ActorContainer
+import plantae.citrus.mqtt.actors.SystemRoot
 import plantae.citrus.mqtt.actors.directory._
 import plantae.citrus.mqtt.actors.session._
-import plantae.citrus.mqtt.dto.PacketDecoder
 import plantae.citrus.mqtt.dto.connect._
-import plantae.citrus.mqtt.dto.ping._
-import plantae.citrus.mqtt.dto.publish._
-import plantae.citrus.mqtt.dto.subscribe.SUBSCRIBE
-import plantae.citrus.mqtt.dto.unsubscribe.UNSUBSCRIBE
+import plantae.citrus.mqtt.packet.{ConnAckPacket, ConnectPacket, ControlPacket, DisconnectPacket}
+import scodec.Codec
+import scodec.bits.BitVector
 
-import scala.concurrent.duration.Duration
-import scala.concurrent.{Await, ExecutionContext}
+sealed trait BridgeState
 
+case object ConnectionWaitConnect extends BridgeState
 
-/**
- * Created by yinjae on 15. 4. 21..
- */
-class PacketBridge(socket: ActorRef) extends Actor with ActorLogging {
-  implicit val timeout = akka.util.Timeout(5, TimeUnit.SECONDS)
-  implicit val ec: ExecutionContext = ExecutionContext.Implicits.global
+case object ConnectionGetSession extends BridgeState
 
-  case object Ack extends Event
+case object ConnectionForwardConnAct extends BridgeState
 
-  var session: ActorRef = null
-  val bridge = self
+case object ConnectionEstablished extends BridgeState
 
-  def receive = {
+sealed trait BridgeData
 
-    case MQTTOutboundPacket(packet) => {
-      socket ! Write(ByteString(packet.encode))
-    }
+case class Session(actor: ActorRef, isCreated: Boolean)
 
-    case Received(data) => {
-      PacketDecoder.decode(data.toArray).foreach(_ match {
-        case connect: CONNECT => {
-          val get = Get(connect.clientId.value, connect.cleanSession)
-          val sessionChecker = context.actorOf(Props(classOf[SessionChecker], this))
-          sessionChecker.tell(get,
-            context.actorOf(Props(new Actor {
+case class SessionCreateContainer(bridge: ActorRef, toSend: ControlPacket) extends BridgeData
+
+case class BridgeContainer(session: ActorRef, bridge: ActorRef, isCreated: Boolean) extends BridgeData
+
+case class RestByteContainer(session: ActorRef, bridge: ActorRef, remainingBytes: BitVector) extends BridgeData
+
+class PacketBridge(socket: ActorRef) extends FSM[BridgeState, BridgeData] with ActorLogging {
+  startWith(ConnectionWaitConnect, SessionCreateContainer(self, null))
+
+  when(ConnectionWaitConnect) {
+    case Event(Received(data), container: SessionCreateContainer) =>
+      PacketDecoder.decode(BitVector(data)) match {
+        case ((head: ConnectPacket) :: Nil, _) =>
+          SystemRoot.directoryProxy.tell(DirectorySessionRequest(head.clientId),
+            context.actorOf(Props(new Actor with ActorLogging {
               def receive = {
-                case clientSession: ActorRef =>
-                  session = clientSession
-                  session.tell(MQTTInboundPacket(connect), bridge)
-                  context.stop(self)
-                  context.stop(sessionChecker)
-              }
-            })))
-        }
-        case mqttPacket: PUBLISH => session ! MQTTInboundPacket(mqttPacket)
-        case mqttPacket: PUBACK => session ! MQTTInboundPacket(mqttPacket)
-        case mqttPacket: PUBREC => session ! MQTTInboundPacket(mqttPacket)
-        case mqttPacket: PUBREL => session ! MQTTInboundPacket(mqttPacket)
-        case mqttPacket: PUBCOMB => session ! MQTTInboundPacket(mqttPacket)
-        case mqttPacket: SUBSCRIBE => session ! MQTTInboundPacket(mqttPacket)
-        case mqttPacket: UNSUBSCRIBE => session ! MQTTInboundPacket(mqttPacket)
-        case PINGREQ => session ! MQTTInboundPacket(PINGREQ)
-        case DISCONNECT => session ! MQTTInboundPacket(DISCONNECT)
-      }
-      )
-    }
-
-    case PeerClosed => {
-      session ! ClientCloseConnection
-      context.stop(self)
-    }
-  }
-
-  case class Get(clientId: String, cleanSession: Boolean)
-
-  class SessionChecker() extends Actor {
-
-    def receive = {
-      case Get(clientId, cleanSession) => {
-        val doSessionActor: ActorRef = sender()
-        ActorContainer.invokeCallback(DirectoryReq(clientId, TypeSession),
-          context, Props(new Actor with ActorLogging {
-            def receive = {
-              case DirectoryResp(name, session) => {
-                if (cleanSession) {
-                  Await.result(session ? SessionReset, Duration.Inf)
+                case DirectorySessionResult(session, isCreated) => {
+                  if (head.variableHeader.cleanSession && !isCreated) {
+                    context.watch(session)
+                    context.stop(session)
+                    context.become({
+                      case Terminated(x) =>
+                        SystemRoot.sessionRoot ! session.path.name
+                      case newSession: ActorRef =>
+                        container.bridge ! Session(newSession, true)
+                        context.stop(self)
+                    })
+                  } else {
+                    container.bridge ! Session(session, isCreated)
+                    context.stop(self)
+                  }
                 }
-                log.debug("clientSession[{}] is passed to [{}]", session.path.name, doSessionActor.path.name)
-                doSessionActor ! session
               }
-            }
-          })
-        )
+            })
+            )
+          )
+          goto(ConnectionGetSession) using SessionCreateContainer(container.bridge, head)
+        case _ => stop(FSM.Shutdown)
       }
-    }
   }
 
+  when(ConnectionGetSession) {
+    case Event(session: Session, container: SessionCreateContainer) =>
+      session.actor ! MQTTInboundPacket(container.toSend)
+      goto(ConnectionForwardConnAct) using BridgeContainer(session.actor, container.bridge, session.isCreated)
+  }
+
+
+  when(ConnectionForwardConnAct) {
+    case Event(MQTTOutboundPacket(connAck: ConnAckPacket), container: BridgeContainer) =>
+      socket ! Write(ByteString(Codec[ControlPacket].encode(ConnAckPacket(connAck.fixedHeader, container.isCreated, connAck.returnCode)).require.toByteBuffer))
+      goto(ConnectionEstablished) using new RestByteContainer(container.session, container.bridge, BitVector.empty)
+  }
+
+  when(ConnectionEstablished) {
+    case Event(MQTTOutboundPacket(packet: ControlPacket), container: RestByteContainer) =>
+      socket ! Write(ByteString(Codec[ControlPacket].encode(packet).require.toByteBuffer))
+      stay using container
+
+    case Event(disconnect: DisconnectPacket, container: RestByteContainer) =>
+      container.session ! MQTTInboundPacket(DisconnectPacket())
+      stop(FSM.Shutdown)
+
+    case Event(packet: ControlPacket, container: RestByteContainer) =>
+      container.session ! MQTTInboundPacket(packet)
+      stay using container
+
+    case Event(Received(data), container: RestByteContainer) =>
+      val decodeResult = PacketDecoder.decode((container.remainingBytes ++ BitVector(data)))
+      decodeResult._1.foreach(self ! _)
+      stay using new RestByteContainer(container.session, container.bridge, decodeResult._2)
+
+    case Event(PeerClosed, container: RestByteContainer) =>
+      container.session ! ClientCloseConnection
+      stop(FSM.Shutdown)
+  }
+
+  whenUnhandled {
+    case e: Event =>
+      log.error("unexpected event : {} ", e)
+      stop(FSM.Shutdown)
+  }
+
+  initialize()
 }
 

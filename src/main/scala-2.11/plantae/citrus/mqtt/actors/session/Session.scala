@@ -4,32 +4,25 @@ import java.util.UUID
 import java.util.concurrent.TimeUnit
 
 import akka.actor._
-import akka.pattern.ask
 import plantae.citrus.mqtt.actors._
 import plantae.citrus.mqtt.actors.directory._
-import plantae.citrus.mqtt.actors.topic.{Subscribe, TopicOutMessage, TopicResponse, Unsubscribe}
-import plantae.citrus.mqtt.dto._
-import plantae.citrus.mqtt.dto.connect.{CONNACK, CONNECT, DISCONNECT, ReturnCode}
-import plantae.citrus.mqtt.dto.ping.{PINGREQ, PINGRESP}
-import plantae.citrus.mqtt.dto.publish._
-import plantae.citrus.mqtt.dto.subscribe.{SUBACK, SUBSCRIBE, TopicFilter}
-import plantae.citrus.mqtt.dto.unsubscribe.{UNSUBACK, UNSUBSCRIBE}
+import plantae.citrus.mqtt.actors.topic._
+import plantae.citrus.mqtt.dto.connect.{ReturnCode, Will}
+import plantae.citrus.mqtt.packet._
 
-import scala.concurrent.Await
-import scala.concurrent.duration.Duration
+case class MQTTInboundPacket(mqttPacket: ControlPacket)
 
-
-case class MQTTInboundPacket(mqttPacket: Packet)
-
-case class MQTTOutboundPacket(mqttPacket: Packet)
+case class MQTTOutboundPacket(mqttPacket: ControlPacket)
 
 sealed trait SessionRequest
 
-sealed trait SessionResponse
+case class SessionCreateRequest(clientId: String)
 
-case object SessionReset extends SessionRequest
+case class SessionCreateResponse(clientId: String, session: ActorRef)
 
-case object SessionResetAck extends SessionResponse
+case class SessionExistRequest(clientId: String)
+
+case class SessionExistResponse(clientId: String, session: Option[ActorRef])
 
 case object SessionKeepAliveTimeOut extends SessionRequest
 
@@ -44,15 +37,36 @@ class SessionRoot extends Actor with ActorLogging {
           sender ! context.actorOf(Props[Session], clientId)
       }
     }
+
+    case SessionCreateRequest(clientId: String) => {
+      context.child(clientId) match {
+        case Some(x) => sender ! x
+        case None => log.debug("new session is created [{}]", clientId)
+          sender ! SessionCreateResponse(clientId, context.actorOf(Props[Session], clientId))
+      }
+    }
+
+    case SessionExistRequest(clientId) =>
+      sender ! SessionExistResponse(clientId, context.child(clientId))
+
   }
 }
 
 class Session extends Actor with ActorLogging {
   implicit val timeout = akka.util.Timeout(5, TimeUnit.SECONDS)
 
-  var connectionStatus: Option[ConnectionStatus] = None
-  val storage = Storage(self.path.name)
+  private var connectionStatus: Option[ConnectionStatus] = None
+  private val storage = Storage(self)
 
+  override def postStop = {
+    log.info("shut down session {}", self)
+    connectionStatus match {
+      case Some(x) => x.cancelTimer
+        connectionStatus = None
+      case None =>
+    }
+    storage.clear
+  }
 
   override def receive: Receive = {
     case MQTTInboundPacket(packet) => handleMQTTPacket(packet, sender)
@@ -84,29 +98,40 @@ class Session extends Actor with ActorLogging {
 
   def handleSession(command: SessionRequest): Unit = command match {
 
-    case SessionReset => {
-      log.debug("session reset : " + self.path.name)
-      connectionStatus = None
-      storage.clear
-      sender ! SessionResetAck
-    }
+    case SessionKeepAliveTimeOut =>
+      log.debug("Session TimeOut : " + self.path.name)
 
-    case SessionKeepAliveTimeOut => {
-      log.debug("No keep alive request!!!!")
-    }
+      connectionStatus match {
+        case Some(x) =>
+          x.destroyAbnormally
+        case None =>
+      }
+
+      connectionStatus = None
+      storage.socketClose
+
+      context.children.foreach(child => {
+        if (child.path.name.startsWith(PublishConstant.inboundPrefix) || child.path.name.startsWith(PublishConstant.outboundPrefix))
+          context.stop(child)
+      })
+
 
     case ClientCloseConnection => {
       log.debug("ClientCloseConnection : " + self.path.name)
       val currentConnectionStatus = connectionStatus
       connectionStatus = None
+      storage.socketClose
+      context.children.foreach(child => {
+        if (child.path.name.startsWith(PublishConstant.inboundPrefix) || child.path.name.startsWith(PublishConstant.outboundPrefix))
+          context.stop(child)
+      })
+
       currentConnectionStatus match {
         case Some(x) =>
-          x.handleWill
-          x.destory
+          x.destroyAbnormally
           log.info(" disconnected without DISCONNECT : [{}]", self.path.name)
         case None => log.info(" disconnected after DISCONNECT : [{}]", self.path.name)
       }
-
     }
   }
 
@@ -119,100 +144,120 @@ class Session extends Actor with ActorLogging {
 
   private def outboundActorName(uniqueId: String) = PublishConstant.outboundPrefix + uniqueId
 
-  def handleMQTTPacket(packet: Packet, bridge: ActorRef): Unit = {
+  def handleMQTTPacket(packet: ControlPacket, bridge: ActorRef): Unit = {
+
     resetTimer
+
     packet match {
-      case mqtt: CONNECT =>
-        connectionStatus = Some(ConnectionStatus(mqtt.will, mqtt.keepAlive.value, self, context, sender))
-        bridge ! MQTTOutboundPacket(CONNACK(true, ReturnCode.connectionAccepted))
+      case mqtt: ConnectPacket =>
+        connectionStatus match {
+          case Some(x) =>
+            x.destroyAbnormally
+          case None =>
+        }
+
+        val mqttWill: Option[Will] = mqtt.variableHeader.willFlag match {
+          case false => None
+          case true => Some(Will(mqtt.variableHeader.willQoS, mqtt.variableHeader.willRetain, mqtt.willTopic.get, mqtt.willMessage.get))
+        }
+
+        connectionStatus = Some(ConnectionStatus(mqttWill, mqtt.variableHeader.keepAliveTime, self, context, sender))
+        bridge ! MQTTOutboundPacket(ConnAckPacket(sessionPresentFlag = true, returnCode = ReturnCode.connectionAccepted))
         log.info("new connection establish : [{}]", self.path.name)
         invokePublish
 
-      case PINGREQ =>
-        bridge ! MQTTOutboundPacket(PINGRESP)
+      case p: PingReqPacket =>
+        bridge ! MQTTOutboundPacket(p)
 
-      case mqtt: PUBLISH => {
-        context.actorOf(Props(classOf[InboundPublisher], sender, mqtt.qos.value), {
-          mqtt.qos.value match {
+      case mqtt: PublishPacket => {
+        context.actorOf(Props(classOf[InboundPublisher], sender, mqtt.fixedHeader.qos), {
+          mqtt.fixedHeader.qos match {
             case 0 => inboundActorName(UUID.randomUUID().toString)
-            case 1 => inboundActorName(mqtt.packetId.get.value.toString)
-            case 2 => inboundActorName(mqtt.packetId.get.value.toString)
+            case 1 => inboundActorName(mqtt.packetId.get.toString)
+            case 2 => inboundActorName(mqtt.packetId.get.toString)
           }
         }) ! mqtt
       }
 
-      case mqtt: PUBREL =>
-        context.child(inboundActorName(mqtt.packetId.value.toString)) match {
+      case mqtt: PubRelPacket =>
+        val actorName = inboundActorName(mqtt.packetId.toString)
+        context.child(actorName) match {
           case Some(x) => x ! mqtt
-          case None => log.error("can't find publish inbound actor {}", inboundActorName(mqtt.packetId.value.toString))
+          case None => log.error("[PUBREL] can't find publish inbound actor {}", actorName)
         }
 
-      case mqtt: PUBREC =>
-        context.child(outboundActorName(mqtt.packetId.value.toString)) match {
+      case mqtt: PubRecPacket =>
+        val actorName = outboundActorName(mqtt.packetId.toString)
+        context.child(actorName) match {
           case Some(x) => x ! mqtt
-          case None => log.error("can't find publish outbound actor {}", outboundActorName(mqtt.packetId.value.toString))
+          case None => log.error("[PUBREC] can't find publish outbound actor {}", actorName)
+
         }
 
-      case mqtt: PUBACK =>
-        context.child(outboundActorName(mqtt.packetId.value.toString)) match {
+      case mqtt: PubAckPacket =>
+        val actorName = outboundActorName(mqtt.packetId.toString)
+        context.child(actorName) match {
           case Some(x) => x ! mqtt
-          case None => log.error("can't find publish outbound actor {}", outboundActorName(mqtt.packetId.value.toString))
+          case None => log.error("[PUBACK] can't find publish outbound actor {} current child actors : {} packetId : {}", actorName,
+            context.children.foldLeft(List[String]())((x, y) => {
+              x :+ y.path.name
+            }), mqtt.packetId)
         }
 
-      case mqtt: PUBCOMB =>
-        context.child(outboundActorName(mqtt.packetId.value.toString)) match {
+      case mqtt: PubCompPacket =>
+        val actorName = outboundActorName(mqtt.packetId.toString)
+        context.child(actorName) match {
           case Some(x) => x ! mqtt
-          case None => log.error("can't find publish outbound actor {}", outboundActorName(mqtt.packetId.value.toString))
+          case None => log.error("[PUBCOMB] can't find publish outbound actor {} ", actorName)
         }
 
-      case DISCONNECT => {
+      case d: DisconnectPacket => {
         val currentConnectionStatus = connectionStatus
         connectionStatus = None
         currentConnectionStatus match {
-          case Some(x) => x.destory
+          case Some(x) => x.destroyProperly
           case None =>
         }
+        storage.socketClose
+        context.children.foreach(child => {
+          if (child.path.name.startsWith(PublishConstant.inboundPrefix) || child.path.name.startsWith(PublishConstant.outboundPrefix))
+            context.stop(child)
+        })
         log.info(" receive DISCONNECT : [{}]", self.path.name)
 
       }
 
-      case subscribe: SUBSCRIBE =>
-        val subscribeResult = subscribeTopics(subscribe.topicFilter)
-        sender ! MQTTOutboundPacket(SUBACK(subscribe.packetId, subscribeResult))
+      case subscribe: SubscribePacket =>
+        subscribeTopics(subscribe)
 
-      case unsubscribe: UNSUBSCRIBE =>
+      case unsubscribe: UnsubscribePacket =>
         unsubscribeTopics(unsubscribe.topicFilter)
-        sender ! MQTTOutboundPacket(UNSUBACK(unsubscribe.packetId))
+        sender ! MQTTOutboundPacket(UnsubAckPacket(packetId = unsubscribe.packetId))
+
+
     }
 
   }
 
-  def subscribeTopics(topicFilters: List[TopicFilter]): List[BYTE] = {
-    val clientId = self.path.name
+  def subscribeTopics(subscribe: SubscribePacket) = {
+    val session = self
 
-    val result = topicFilters.map(tp =>
-      Await.result(ActorContainer.directoryProxy ? DirectoryReq(tp.topic.value, TypeTopic), Duration.Inf) match {
-        case DirectoryResp2(topicName, options) =>
-          options.foreach(actor => actor ! Subscribe(self.path.name))
-          //          option ! Subscribe(self.path.name)
-          BYTE(0x00)
-      }
-    )
-    result
+    context.actorOf(SubscribeTopic.props(subscribe.topicFilter, session, connectionStatus,subscribe))
   }
 
-  def unsubscribeTopics(topics: List[STRING]) = {
+  def unsubscribeTopics(topics: List[String]) = {
+    val session = self
     topics.foreach(x => {
-      ActorContainer.invokeCallback(DirectoryReq(x.value, TypeTopic), context, Props(new Actor {
+      SystemRoot.directoryProxy.tell(DirectoryTopicRequest(x), context.actorOf(Props(new Actor {
         def receive = {
-          case DirectoryResp2(name, topicActors) =>
-            topicActors.foreach(actor => actor ! Unsubscribe(self.path.name))
+          case DirectoryTopicResult(name, topicActors) =>
+            topicActors.par.foreach(actor => actor ! Unsubscribe(session))
           //          topicActor != UNSUBSCRIBE
         }
-      }))
+      })))
+
     }
     )
-
   }
 
   def invokePublish = {
@@ -222,7 +267,7 @@ class Session extends Actor with ActorLogging {
         storage.nextMessage match {
           case Some(x) =>
             val actorName = PublishConstant.outboundPrefix + (x.packetId match {
-              case Some(y) => y.value
+              case Some(y) => y
               case None => UUID.randomUUID().toString
             })
 
@@ -234,7 +279,6 @@ class Session extends Actor with ActorLogging {
               case None =>
                 log.debug("create new actor publish  complete {} ", actorName)
                 context.actorOf(Props(classOf[OutboundPublisher], client.socket, session), actorName) ! x
-
             }
 
           case None => log.debug("invoke publish but no message : child actor count - {} ", context.children.foldLeft(List[String]())((x, ac) => x :+ ac.path.name))
@@ -242,5 +286,58 @@ class Session extends Actor with ActorLogging {
       case None => log.debug("invoke publish but no connection : child actor count - {}", context.children.foldLeft(List[String]())((x, ac) => x :+ ac.path.name))
     }
   }
+
+}
+
+object SubscribeTopic {
+  def props(topicFilter: List[(String, Short)], session: ActorRef, connectionStatus: Option[ConnectionStatus], subscribe: SubscribePacket) = {
+    Props(classOf[SubscribeTopic], topicFilter, session, connectionStatus, subscribe)
+  }
+}
+
+class SubscribeTopic(topicFilter: List[(String, Short)],
+                     session: ActorRef,
+                     connectionStatus: Option[ConnectionStatus],
+                     subscribe: SubscribePacket) extends Actor with ActorLogging {
+
+  topicFilter.map(x => self ! DirectoryTopicRequest(x._1))
+  val topicFilterResult = scala.collection.mutable.Map[String, Short]()
+  var count = 0
+
+  override def receive = {
+    case request: DirectoryTopicRequest =>
+      log.debug("[SUBSCRIBE] : request({})", request.name)
+      SystemRoot.directoryProxy ! request
+    case DirectoryTopicResult(topicName, options) =>
+      val qos = topicFilter.foldRight[Short](0)((a,b) => if (a._1 == topicName) a._2 else b)
+      log.debug("[SUBSCRIBE] : session({}) qos({})", session, qos)
+      options.par.foreach(actor => actor.tell(Subscribe(SessionAndQos(session, qos)), self))
+
+    case Subscribed(name) =>
+      topicFilterResult.put(name, 0.toShort)
+      count = count + 1
+      log.debug("[SUBSCIRBE] topicFilterCount({}) now({})", topicFilter.size, count)
+      if (count == topicFilter.size) {
+        val result = topicFilter.map(x =>
+          topicFilterResult.get(x._1) match {
+            case Some(y) => y
+            case None => 0x80.toShort
+          }
+        )
+
+        log.debug("[SUBSCRIBE] : result ({})", result)
+
+        connectionStatus match {
+
+          case Some(x) => x.socket ! MQTTOutboundPacket(
+            SubAckPacket(packetId = subscribe.packetId, returnCode = result)
+          )
+          case None =>
+        }
+        context.stop(self)
+      }
+  }
+  // TODO : need timed out
+  // deadletter created by topic actor but it will be thrown away by default.
 
 }
